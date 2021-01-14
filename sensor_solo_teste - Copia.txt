@@ -1,0 +1,287 @@
+#include <math.h>       // Conversion equation from resistance to %
+#include "adc_corrected.h"
+#include <driver/adc.h>
+#include <esp_adc_cal.h>
+#include <WiFi.h>
+#include <WiFiMulti.h>
+#include <PubSubClient.h>
+
+
+// Setting up format for reading 3 soil sensors
+#define NUM_READS 10    // Number of sensor reads for filtering
+long buffer[NUM_READS];
+int indexx;
+
+typedef struct {        // Structure to be used in percentage and resistance values matrix to be filtered (have to be in pairs)
+  int moisture;
+  long resistance;
+} values;
+
+const long knownResistor = 4900;  // Constant value of known resistor in Ohms
+int supplyVoltage;                // Measured supply voltage
+int sensorVoltage;                // Measured sensor voltage
+values valueOf[NUM_READS];        // Calculated moisture percentages and resistances to be sorted and filtered
+int i;                            // Simple indexx variable
+
+#define DEFAULT_VREF    1086
+
+static const adc_bits_width_t width = ADC_WIDTH_BIT_12;
+static const adc_atten_t atten = ADC_ATTEN_DB_11;
+static const adc_unit_t unit = ADC_UNIT_1;
+esp_adc_cal_characteristics_t adc_cal;
+
+// -----------------------------------------------------------------#
+#define WIFISSID01 "extensao_iot" // Put your WifiSSID here
+#define PASSWORD01 "aluno123" // Put your wifi password here
+
+#define WIFISSID02 "IFPE-PUBLICA" // Put your WifiSSID here
+#define PASSWORD02 "aluno123" // Put your wifi password here
+
+#define WIFISSID03 "GVT-F051" // Put your WifiSSID here
+#define PASSWORD03 "1316309065" // Put your wifi password here
+
+char servidorMqtt[] = "172.0.0.1";
+char portaServidorMqtt[6] = "1883";
+char tokenMqttDisp[33] = "ESP32_UMIDADE_SOLO";
+
+WiFiMulti wifiMulti;
+WiFiClient wifiClient;
+PubSubClient client(wifiClient);
+
+void setup() {
+
+  adc1_config_width(ADC_WIDTH_BIT_12);//Configura a resolucao
+  adc1_config_channel_atten(ADC1_CHANNEL_4, atten);//Configura a atenuacao
+  adc1_config_channel_atten(ADC1_CHANNEL_5, atten);//Configura a atenuacao
+
+  adc1_config_channel_atten(ADC1_CHANNEL_6, atten);//Configura a atenuacao
+  adc1_config_channel_atten(ADC1_CHANNEL_7, atten);//Configura a atenuacao
+
+  esp_adc_cal_value_t adc_type = esp_adc_cal_characterize(unit, atten, width, DEFAULT_VREF, &adc_cal);
+
+  // initialize serial communications at 9600 bps:
+  Serial.begin(9600);
+  pinMode(33, INPUT);
+  pinMode(32, INPUT);
+  pinMode(35, INPUT);
+  pinMode(34, INPUT);
+
+  beginClient();
+  imprimirInformacoesWifiEMQTT();
+}
+
+void loop() {
+  bool isConnected = connected() ? true : conectar();
+  if (isConnected) {
+    measureSensor(1, 22, 23, 33, 32, ADC1_CHANNEL_5, ADC1_CHANNEL_4, knownResistor );
+    measureSensor(2, 18, 19, 35, 34, ADC1_CHANNEL_7, ADC1_CHANNEL_6, 4600 );
+    delay (3 * 60000);
+  } else {
+    Serial.println("Nao conectado.");
+    delay(1000);
+  }
+}
+
+void measureSensor(int sensor, int phase_a, int phase_b, int analog_input, int analog_input2, adc1_channel_t channel, adc1_channel_t channel2, long knownResistor) {
+  measure(phase_a, phase_b, analog_input, channel, knownResistor);
+  long firstReading = average();
+  measure(phase_b, phase_a, analog_input2, channel2, knownResistor);
+  long secondReading = average();
+
+  printOutpuSensor(sensor, firstReading, secondReading);
+}
+
+void printOutpuSensor(int sensor, long firstReading, long secondReading) {
+  long bias = abs(firstReading - secondReading);
+  long readingAvg = (firstReading + secondReading) / 2;
+  Serial.print ("\nSensor");
+  Serial.print (sensor);
+  Serial.print ("\t" );
+  Serial.print ("read 1\t" );
+  Serial.print (firstReading);
+  Serial.print ("\t" );
+  Serial.print ("read 2\t" );
+  Serial.print (secondReading);
+  Serial.print ("\t" );
+  Serial.print ("bias\t" );
+  Serial.print (bias);
+  Serial.print ("\t" );
+  Serial.print ("value\t");
+  Serial.print (readingAvg);
+}
+
+void measure (int phase_a, int phase_b, int analog_input, adc1_channel_t channel, long knownResistor) {
+  // read sensor, filter, and calculate resistance value
+  // Noise filter: median filter
+  long resistance;
+  long sensorVoltageByChannel;
+  float  supplyVoltageFinal, sensorVoltageFinal, sensorVoltageFinal1;
+  for (i = 0; i < NUM_READS; i++) {
+    pinMode(phase_a, OUTPUT);
+    pinMode(phase_b, INPUT);
+
+    digitalWrite(phase_a, HIGH);                 // set the voltage supply on
+    delayMicroseconds(100);
+    supplyVoltage = analogReadByTable(analog_input);   // read the supply voltage
+    delayMicroseconds(100);
+    digitalWrite(phase_a, LOW);                  // set the voltage supply off
+    delay(1);
+
+    pinMode(phase_a, INPUT);
+    pinMode(phase_b, OUTPUT);
+
+    digitalWrite(phase_b, HIGH);                 // set the voltage supply on
+    delayMicroseconds(100);
+    sensorVoltage = analogReadByTable(analog_input);   // read the sensor voltage
+    delayMicroseconds(100);
+    sensorVoltageByChannel = analogReadByAPI(channel);
+    delayMicroseconds(100);
+    digitalWrite(phase_b, LOW);                  // set the voltage supply off
+
+    // Calculate resistance
+    // the 0.5 add-term is used to round to the nearest integer
+    // Tip: no need to transform 0-1023 voltage value to 0-5 range, due to following fraction
+    supplyVoltageFinal = rawToVoltageByTable(supplyVoltage);
+    //sensorVoltageFinal = rawToVoltageByTable(sensorVoltage);
+    sensorVoltageFinal = rawToVoltageByAPI(sensorVoltageByChannel);
+    //sensorVoltageFinal = (sensorVoltageFinal + sensorVoltageFinal1) / 2;
+
+    //    Serial.print("\nsupplyVoltage: ");
+    //    Serial.print(supplyVoltage);
+    //    Serial.print("\t");
+    //    Serial.print(supplyVoltageFinal);
+    //    Serial.print("\t");
+    //    Serial.print("sensorVoltage: ");
+    //    Serial.print(sensorVoltageByChannel);
+    //    Serial.print("\t");
+    //    Serial.println(sensorVoltageFinal);
+    if (sensorVoltageFinal <= 0.17) {//Esse valo foi definido abrindo o circuito (resistor) e aferindo o valor de sensorVoltageFinal
+      sensorVoltageFinal = 0.1; // Evitar exceção e elevar o valor resistência para próximo do máximo possível aferido.
+    }
+    resistance = (knownResistor * (supplyVoltageFinal - sensorVoltageFinal ) / sensorVoltageFinal) ;
+    delay(1);
+    addReading(resistance);
+    //Serial.print (resistance);
+    //Serial.print ("\t");
+  }
+  //  Serial.print("\nsupplyVoltage: ");
+  //  Serial.print(supplyVoltage);
+  //  Serial.print("\t");
+  //  Serial.print(rawToVoltageByTable(supplyVoltage));
+  //  Serial.print("\t");
+  //  Serial.print(supplyVoltage1);
+  //  Serial.print("\t");
+  //  Serial.print("sensorVoltage: ");
+  //  Serial.print(sensorVoltage);
+  //  Serial.print("\t");
+  //  Serial.print(rawToVoltageByTable(sensorVoltage));
+  //  Serial.print("\t");
+  //  Serial.print(sensorVoltageByChannel);
+  //  Serial.print("\t");
+  //  Serial.print(rawToVoltageByAPI(sensorVoltage1));
+  //  Serial.print("\t");
+  //  Serial.print("resistance: ");
+  //  Serial.println(resistance);
+}
+
+int analogReadByTable(int analog_input) {
+  int voltage = analogRead(analog_input);
+  return ADC_LUT[voltage];
+}
+
+float rawToVoltageByTable(int value) {
+  return value * 3.3 / 4095;
+}
+
+int analogReadByAPI(adc1_channel_t channel) {
+  return adc1_get_raw(channel);//Obtem o valor RAW do ADC
+}
+
+float rawToVoltageByAPI(int value) {
+  return esp_adc_cal_raw_to_voltage(value, &adc_cal) / 1000.0;
+}
+
+// Averaging algorithm
+void addReading(long resistance) {
+  buffer[indexx] = resistance;
+  indexx++;
+  if (indexx >= NUM_READS) indexx = 0;
+}
+
+long average() {
+  long sum = 0;
+  for (int i = 0; i < NUM_READS; i++) {
+    sum += buffer[i];
+  }
+  return (long)(sum / NUM_READS);
+}
+
+boolean connected() {
+  return client.connected();
+}
+
+bool conectar() {
+  // Loop until we're reconnected
+  Serial.println("Reconectando...");
+  //status = WiFi.status();
+  Serial.print("Wifi status: ");
+  Serial.println(WiFi.status());
+  Serial.println(WiFi.SSID());
+  bool isWifiConnected = WiFi.status() != WL_CONNECTED ? true : inicializarWiFi();
+  bool isMQTTConnected = false;
+  if (isWifiConnected) {
+    Serial.print("Connecting to ThingsBoard node ...");
+    // Attempt to connect (clientId, username, password)
+    isMQTTConnected = client.connect("ESP8266 Device", tokenMqttDisp, NULL);
+    if ( isMQTTConnected ) {
+      Serial.println( "[DONE]" );
+      // Subscribing to receive RPC requests
+      client.subscribe("v1/devices/me/rpc/request/+");
+      // Sending current GPIO status
+      Serial.println("Sending current GPIO status ...");
+      //client.publish("v1/devices/me/attributes", get_gpio_status().c_str());
+    } else {
+      Serial.print( "[FAILED] [ rc = " );
+      Serial.print( client.state() );
+      Serial.println( " : retrying in 5 seconds]" );
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
+  }
+  return isMQTTConnected;
+}
+
+void beginClient() {
+  Serial.println("Starting wifi...");
+  inicializarWiFi();
+  client.setServer(servidorMqtt , 1883);
+}
+
+bool inicializarWiFi() {
+  bool isConnected = false;
+  WiFi.mode(WIFI_STA);
+  wifiMulti.addAP(WIFISSID01, PASSWORD01);
+  wifiMulti.addAP(WIFISSID02, PASSWORD02);
+  wifiMulti.addAP(WIFISSID03, PASSWORD03);
+  Serial.println("Connecting Wifi...");
+  if (wifiMulti.run() == WL_CONNECTED) {
+    Serial.println("");
+    Serial.println("WiFi connected");
+    Serial.println("IP address: ");
+    Serial.println(WiFi.localIP());
+    isConnected = true;
+  } else {
+    Serial.println("WiFi is not connected!");
+  }
+  return isConnected;
+}
+
+void imprimirInformacoesWifiEMQTT() {
+  // Imprimir os valores-padrão das variáveis referentes ao WiFi e servidor MQTT
+  Serial.println(tokenMqttDisp);
+  Serial.println(servidorMqtt);
+  Serial.println("local ip");
+  Serial.println(WiFi.localIP());
+  Serial.println(WiFi.gatewayIP());
+  Serial.println(WiFi.subnetMask());
+}
